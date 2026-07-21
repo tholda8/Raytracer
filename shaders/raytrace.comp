@@ -1,0 +1,557 @@
+#version 460
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba32f, binding = 0) uniform image2D img;
+
+
+// object data - packed to match std430 (16-byte alignment)
+struct Object {
+    uint type; // 0: sphere, 1: plane
+    uint materialId;
+    uint pad0;
+    float instanceAngle;
+    vec4 pos; // xyz = center
+    vec4 parameter1; // e.g. radius in .x
+    vec4 parameter2;
+    vec4 instancePos;
+    vec4 instanceRotAxis;
+};
+
+// material data - pack parameter (roughness) into albedo.w
+struct Material {
+    uint type; // 0: diffuse, 1: metallic
+    float emissivity;
+    uint pad1;
+    uint pad2;
+    vec4 albedo; // xyz = color, w = parameter (roughness)
+};
+
+// SSBO bindings
+layout(std430, binding = 1) readonly buffer Objects { Object objects[]; };
+layout(std430, binding = 2) readonly buffer Materials { Material materials[]; };
+
+
+
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+struct HitRecord {
+    float t;
+    vec3 point;
+    vec3 normal;
+    uint materialId;
+    bool hit;
+    bool frontFace;
+};
+
+
+// Camera parameters (set from the CPU with glUniform* when running the shader)
+uniform vec3 CameraPos;
+// send camera basis vectors from CPU to avoid per-ray trigonometry
+uniform vec3 CameraForward;
+uniform vec3 CameraRight;
+uniform vec3 CameraUp;
+// frame counter for RNG seeding
+uniform int FrameCount;
+// precomputed tangent of half FOV (tan(fovRadians * 0.5)) computed on CPU at scene load
+uniform float TanFov;
+uniform float DiskSize;
+uniform float FocalDist;
+// debug mode: 0 = off, 1 = output material param (albedo.w) for first hit
+uniform int DebugMode;
+
+
+const float epsilon = 0.00001;
+const uint maxBounces = 30;//30;
+
+// number of valid objects/materials (set by CPU)
+uniform int ObjectCount;
+uniform int MaterialCount;
+
+
+
+// Simple integer hash / RNG based on pixel coords and frame counter
+uint wang_hash(uint seed) {
+    seed = (seed ^ 61u) ^ (seed >> 16);
+    seed *= 9u;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2du;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}   
+
+const float PI = 3.14159265358979323846;
+uint rng_counter = 0u;
+
+// seedable rand: include an index so repeated calls per-pixel produce different values
+float randf_seed(ivec2 pixel, int frame, int idx) {
+    uint px = uint(pixel.x);
+    uint py = uint(pixel.y);
+    uint s = uint(frame) + px * 73856093u + py * 19349663u + uint(idx) * 83492791u;
+    uint h = wang_hash(s);
+    return float(h & 0x00ffffffu) / float(0x01000000u);
+}
+float randf() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    // post-increment a global counter so subsequent calls return different values
+    uint idx = rng_counter++;
+    return randf_seed(pixel, FrameCount, int(idx));
+}
+
+// generate three random floats (0..1) using a base index
+vec3 rand3(ivec2 pixel, int frame, int baseIdx) {
+    return vec3(randf_seed(pixel, frame, baseIdx + 0),
+                randf_seed(pixel, frame, baseIdx + 1),
+                randf_seed(pixel, frame, baseIdx + 2));
+}
+
+vec3 randomUnitVector() {
+    float u = randf(); // [0,1)
+    float v = randf(); // [0,1)
+    float z = u * 2.0 - 1.0; // cos(theta) in [-1,1]
+    float phi = 2.0 * PI * v;
+    float rxy = sqrt(max(0.0, 1.0 - z * z));
+    float x = rxy * cos(phi);
+    float y = rxy * sin(phi);
+    return vec3(x, y, z);
+}
+
+vec2 randomInUnitDisk() {
+    // uniform distribution over unit disk
+    float r = sqrt(randf());
+    float theta = 2.0 * PI * randf();
+    return vec2(r * cos(theta), r * sin(theta));
+}
+Ray getRay(vec2 uv) {
+    // uv is in [-1,1] space as produced in main(); use precomputed camera basis
+    float tanFov = TanFov;
+    // compute focal point on the focal plane at distance 'FocalDist' from the camera
+    vec3 focalPoint = CameraPos
+                    + CameraForward * FocalDist
+                    + CameraRight * (uv.x * tanFov * FocalDist)
+                    + CameraUp    * (uv.y * tanFov * FocalDist);
+
+    // sample lens aperture
+    vec2 ran = randomInUnitDisk();
+    vec3 diskOffset = (CameraRight * ran.x + CameraUp * ran.y) * DiskSize;
+
+    vec3 origin = CameraPos + diskOffset;
+    vec3 dir = normalize(focalPoint - origin); // ray goes through focal point
+
+    return Ray(origin, dir);
+}
+
+mat3 makeONB(vec3 n) {
+    vec3 w = normalize(n);
+    vec3 a = (abs(w.x) > 0.9) ? vec3(0,1,0) : vec3(1,0,0);
+    vec3 v = normalize(cross(w, a));
+    vec3 u = cross(w, v);
+    return mat3(u, v, w);
+}
+
+// Sample a random point on a quad (returns the point and area)
+
+
+// PDF for a specific sampled point on the quad, converted to solid-angle PDF at the shading point
+
+vec3 randomCosineDirection() {
+    float r1 = randf();
+    float r2 = randf();
+    float z = sqrt(1.0 - r2);       // cos(theta)
+    float phi = 2.0 * PI * r1;
+    float x = cos(phi) * sqrt(r2);  // sin(theta) * cos(phi)
+    float y = sin(phi) * sqrt(r2);  // sin(theta) * sin(phi)
+    return vec3(x, y, z);
+}
+
+
+
+HitRecord sphereIntersect(Ray ray, Object obj) {
+    HitRecord rec;
+    rec.hit = false;
+    vec3 oc = ray.origin - obj.pos.xyz;
+    float b = 2.0 * dot(oc, ray.direction);
+    float c = dot(oc, oc) - obj.parameter1.x * obj.parameter1.x;
+    float disc = b*b - 4.0 * c;
+    if (disc > 0.0) {
+        float sd = sqrt(disc);
+        float t = (-b - sd) * 0.5;
+        if (t < 0.0) t = (-b + sd) * 0.5;
+        if (t >= 0.0) {
+            rec.t = t;
+            rec.point = ray.origin + t * ray.direction;
+            rec.normal = normalize(rec.point - obj.pos.xyz);
+            rec.materialId = obj.materialId;
+            rec.hit = true;
+            rec.frontFace = dot(ray.direction, rec.normal) < 0.0;
+            rec.normal = rec.frontFace ? rec.normal : -rec.normal;
+        }
+    }
+    return rec;
+}
+
+vec2 getUv(ivec2 pixel)
+{
+    ivec2 sizei = imageSize(img);
+    vec2 size = vec2(sizei);
+    float aspect = float(sizei.x) / float(sizei.y);
+    vec2 pixelCenter = vec2(pixel) + vec2(0.5);
+    vec2 uv = pixelCenter / size; // 0..1 (use pixel center)
+    uv = uv * 2.0 - 1.0; // -1..1
+    uv.x *= aspect;
+    return uv;
+}
+
+
+
+HitRecord quadIntersect(Ray ray, Object obj) {
+    HitRecord rec;
+    rec.hit = false;
+
+    vec3 p0 = obj.pos.xyz;
+    vec3 u = obj.parameter1.xyz;
+    vec3 v = obj.parameter2.xyz;
+    vec3 normal = normalize(cross(u, v));
+
+    float denom = dot(normal, ray.direction);
+    if (abs(denom) > epsilon) { // not parallel
+        float t = dot(p0 - ray.origin, normal) / denom;
+        if (t >= 0.0) {
+            vec3 p = ray.origin + t * ray.direction;
+            vec3 d = p - p0;
+
+            float uu = dot(u, u);
+            float uv = dot(u, v);
+            float vv = dot(v, v);
+            float du = dot(d, u);
+            float dv = dot(d, v);
+
+            // Barycentric coordinates
+            float s = (uv * dv - vv * du) / (uv * uv - uu * vv);
+            float t_param = (uv * du - uu * dv) / (uv * uv - uu * vv);
+
+            if (s >= 0.0 && s <= 1.0 && t_param >= 0.0 && t_param <= 1.0) {
+                rec.t = t;
+                rec.point = p;
+                rec.normal = normal;
+                rec.materialId = obj.materialId;
+                rec.hit = true;
+                rec.frontFace = dot(ray.direction, rec.normal) < 0.0;
+                rec.normal = rec.frontFace ? rec.normal : -rec.normal;
+            }
+        }
+    }
+    return rec;
+}
+
+HitRecord cylinderIntersect(Ray ray, Object obj) {
+    HitRecord rec;
+    rec.hit = false;
+
+    float r = obj.parameter1.x;
+    float h = obj.parameter1.y;
+    vec3 ro = ray.origin;
+    vec3 rd = ray.direction;
+
+    float z0 = obj.pos.z;           // bottom z
+    float z1 = z0 + h;              // top z
+
+    float bestT = 1e30;
+    int hitType = -1; // 0 = side, 1 = bottom cap, 2 = top cap
+    // Cylinder aligned along Y axis (bottom at y0, top at y1)
+    float y0 = obj.pos.y;
+    float y1 = y0 + h;
+
+    // SIDE intersection (infinite cylinder along Y, then clip by y0..y1)
+    vec2 oc_xz = ro.xz - obj.pos.xz;
+    vec2 rd_xz = rd.xz;
+    float a_xz = dot(rd_xz, rd_xz);
+    if (a_xz > epsilon) {
+        float b_xz = 2.0 * dot(oc_xz, rd_xz);
+        float c_xz = dot(oc_xz, oc_xz) - r * r;
+        float disc_xz = b_xz * b_xz - 4.0 * a_xz * c_xz;
+        if (disc_xz > 0.0) {
+            float sqrtD = sqrt(disc_xz);
+            float tA = (-b_xz - sqrtD) / (2.0 * a_xz);
+            float tB = (-b_xz + sqrtD) / (2.0 * a_xz);
+            if (tA > epsilon) {
+                float y = ro.y + tA * rd.y;
+                if (y >= y0 - epsilon && y <= y1 + epsilon && tA < bestT) {
+                    bestT = tA;
+                    hitType = 0;
+                }
+            }
+            if (tB > epsilon) {
+                float y = ro.y + tB * rd.y;
+                if (y >= y0 - epsilon && y <= y1 + epsilon && tB < bestT) {
+                    bestT = tB;
+                    hitType = 0;
+                }
+            }
+        }
+    }
+
+    // CAPS intersections (bottom and top disks at y0 and y1)
+    if (abs(rd.y) > epsilon) {
+        // bottom cap y = y0
+        float tCap = (y0 - ro.y) / rd.y;
+        if (tCap > epsilon && tCap < bestT) {
+            vec3 p = ro + tCap * rd;
+            if (dot(p.xz - obj.pos.xz, p.xz - obj.pos.xz) <= r * r + epsilon) {
+                bestT = tCap;
+                hitType = 1;
+            }
+        }
+        // top cap y = y1
+        tCap = (y1 - ro.y) / rd.y;
+        if (tCap > epsilon && tCap < bestT) {
+            vec3 p = ro + tCap * rd;
+            if (dot(p.xz - obj.pos.xz, p.xz - obj.pos.xz) <= r * r + epsilon) {
+                bestT = tCap;
+                hitType = 2;
+            }
+        }
+    }
+
+    if (hitType != -1) {
+        rec.t = bestT;
+        rec.point = ro + bestT * rd;
+        if (hitType == 0) {
+            // side normal uses XZ components
+            vec2 n_xz = rec.point.xz - obj.pos.xz;
+            rec.normal = normalize(vec3(n_xz.x, 0.0, n_xz.y));
+        } else if (hitType == 1) {
+            // bottom cap normal points -Y
+            rec.normal = vec3(0.0, -1.0, 0.0);
+        } else {
+            // top cap normal points +Y
+            rec.normal = vec3(0.0, 1.0, 0.0);
+        }
+        rec.materialId = obj.materialId;
+        rec.hit = true;
+        rec.frontFace = dot(ray.direction, rec.normal) < 0.0;
+        rec.normal = rec.frontFace ? rec.normal : -rec.normal;
+    }
+
+    return rec;
+}
+
+
+
+struct Interval
+{
+    float min;
+    float max;
+};
+
+bool intersectInterval(Interval a, Interval b)
+{
+    return (a.min <= b.max) && (b.min <= a.max);
+}
+
+HitRecord boxIntersect(Ray ray, Object obj) {
+    HitRecord rec;
+    rec.hit = false;
+
+    // Get box min and max corners
+    vec3 minCorner = obj.pos.xyz;
+    vec3 maxCorner = minCorner + obj.parameter1.xyz;
+    Interval tIntervals[3];
+
+    for(int i = 0; i < 3; ++i) {
+
+        float t0 = (minCorner[i] - ray.origin[i])/ray.direction[i];
+        float t1 = (maxCorner[i] - ray.origin[i])/ray.direction[i];
+        tIntervals[i].min = min(t0, t1);
+        tIntervals[i].max = max(t0, t1);
+    }
+
+    if (intersectInterval(tIntervals[0], tIntervals[1]) &&
+        intersectInterval(tIntervals[0], tIntervals[2]) &&
+        intersectInterval(tIntervals[1], tIntervals[2])) {
+
+        float tmin = max(max(tIntervals[0].min, tIntervals[1].min), tIntervals[2].min);
+        float tmax = min(min(tIntervals[0].max, tIntervals[1].max), tIntervals[2].max);
+
+        if (tmax >= max(tmin, 0.0)) {
+            rec.t = tmin >= 0.0 ? tmin : tmax;
+            rec.point = ray.origin + rec.t * ray.direction;
+
+            // Compute normal
+            vec3 p = rec.point;
+            vec3 n = vec3(0.0);
+            for(int i = 0; i < 3; ++i) {
+                if (abs(p[i] - minCorner[i]) < epsilon) n[i] = -1.0;
+                else if (abs(p[i] - maxCorner[i]) < epsilon) n[i] = 1.0;
+            }
+            rec.normal = normalize(n);
+            rec.materialId = obj.materialId;
+            rec.hit = true;
+            rec.frontFace = dot(ray.direction, rec.normal) < 0.0;
+            rec.normal = rec.frontFace ? rec.normal : -rec.normal;
+        }
+    }
+
+    return rec;
+}
+
+
+vec3 rotate(vec3 v, vec3 axis, float angle) {
+    axis = normalize(axis);
+    float cosA = cos(angle);
+    float sinA = sin(angle);
+    return v * cosA + cross(axis, v) * sinA + axis * dot(axis, v) * (1.0 - cosA);
+}
+
+HitRecord intersect(Ray ray, Object obj) {
+    HitRecord rec;
+    rec.hit = false;
+    Ray rayInstanced;
+    rayInstanced.origin = ray.origin;
+    rayInstanced.direction = ray.direction;
+
+    rayInstanced.origin -= obj.instancePos.xyz;
+    if (obj.instanceAngle != 0.0) {
+        rayInstanced.origin = rotate(rayInstanced.origin, obj.instanceRotAxis.xyz, -obj.instanceAngle);
+        rayInstanced.direction = rotate(rayInstanced.direction, obj.instanceRotAxis.xyz, -obj.instanceAngle);
+    }
+
+    if (obj.type == 0) { // sphere
+        rec = sphereIntersect(rayInstanced, obj);
+    } else if (obj.type == 1) { // quad
+        rec = quadIntersect(rayInstanced, obj);
+    } else if (obj.type == 2) { // box
+        rec = boxIntersect(rayInstanced, obj);
+    } else if (obj.type == 3) { // cylinder
+        rec = cylinderIntersect(rayInstanced, obj);
+    }
+    
+    // Only transform hit records back to world space if there was a hit.
+    if (rec.hit) {
+        rec.point = ray.origin + rec.t * ray.direction;
+        if (obj.instanceAngle != 0.0)
+            rec.normal = rotate(rec.normal, obj.instanceRotAxis.xyz, obj.instanceAngle);
+    }
+
+    // add other object types here...
+    return rec;
+}
+
+
+HitRecord GetNearestHit(Ray ray) {
+    HitRecord nearestRec;
+    nearestRec.t = 1e30; // large value
+    nearestRec.hit = false;
+    
+    for (int i = 0; i < ObjectCount; ++i) {
+        HitRecord rec = intersect(ray, objects[i]);
+        if (rec.hit && rec.t < nearestRec.t) {
+            nearestRec = rec;
+        }
+    }
+    return nearestRec;
+}
+
+vec3 backgroundColor(Ray ray) {
+    // simple gradient background
+    return mix(vec3(1.0, 1.0, 1.0), vec3(0.5, 0.7, 1.0),  ray.direction.y * 0.5 + 0.5);
+}
+
+
+
+
+
+float scatteringPDF(vec3 normal, vec3 outDir) {
+    float cosine = max(dot(normal, outDir), 0.0);
+    return cosine / PI;
+}
+
+float reflectance(float cosine, float refraction_index) {
+    // Use Schlick's approximation for reflectance.
+    float r0 = (1 - refraction_index) / (1 + refraction_index);
+    r0 = r0*r0;
+    return r0 + (1-r0)*pow((1 - cosine),5);
+}
+
+vec3 calculateDirection(HitRecord rec, Ray ray) {
+    uint matType = materials[rec.materialId].type;
+    if (matType == 0) {
+        // diffuse reflection
+        mat3 onb = makeONB(rec.normal);
+        vec3 localDir = randomCosineDirection();
+        vec3 worldDir = normalize(onb * localDir);
+        return worldDir;
+    }
+    else if(matType == 1) {
+        // metallic reflection
+        vec3 reflected = reflect(normalize(ray.direction), rec.normal);
+        reflected += materials[rec.materialId].albedo.w * randomUnitVector(); // roughness
+        return normalize(reflected);
+    }else if(matType == 2) {
+        vec3 I = normalize(ray.direction);
+        vec3 N = rec.normal;
+        float ior = materials[rec.materialId].albedo.w;
+        float eta = rec.frontFace ? (1.0 / ior) : ior;
+        vec3 refracted = refract(I, N, eta);
+        float cos_theta = min(dot(-I, N), 1.0);
+        if (length(refracted) < epsilon || reflectance(cos_theta, ior) > randf()) {
+            return reflect(I, N);
+        }
+        return refracted;
+
+    }
+    return vec3(0.0);
+}
+
+
+
+
+
+//for rest of your life book, PBR, BVH
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = getUv(pixel);
+
+    vec3 color = vec3(0.0);
+    Ray ray = getRay(uv);
+
+    vec3 throughput = vec3(1.0);
+    //Object light = findRandomLight();
+
+    for (uint bounce = 0; bounce < maxBounces; ++bounce) {
+        HitRecord rec = GetNearestHit(ray);
+        if (!rec.hit) break;
+
+        Material mat = materials[rec.materialId];
+        // accumulate emission (material color modulated by emissivity)
+        color += throughput * mat.albedo.xyz * mat.emissivity;
+        
+
+        if (max(throughput.r, max(throughput.g, throughput.b)) < 1e-4)
+            break;
+
+        // Russian roulette od třetího bounce
+        if (bounce >= 3) {
+            float pSurvive = max(throughput.r, max(throughput.g, throughput.b));
+            pSurvive = clamp(pSurvive, 0.05, 0.95); // nebo 0.1 a 0.9, jak ti vyhovuje
+
+            if (randf() > pSurvive) {
+                // cesta umírá
+                break;
+            }
+            // cesta přežila → převážíme throughput
+            throughput /= pSurvive;
+        }
+        
+        ray.direction = calculateDirection(rec, ray);
+        throughput *= mat.albedo.xyz;
+        ray.origin = rec.point + ray.direction * epsilon;
+
+    }
+    imageStore(img, pixel, vec4(color, 1.0));
+    
+
+    return;
+}
