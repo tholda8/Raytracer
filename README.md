@@ -5,32 +5,96 @@ Done with [RayTracingInOneWeekend](https://raytracing.github.io/books/RayTracing
 <img width="1339" height="1340" alt="Snímek obrazovky 2026-07-21 211650" src="https://github.com/user-attachments/assets/c4b77b10-9684-4dc7-8e83-0ec4235237d2" />
 <img width="1641" height="1295" alt="Snímek obrazovky 2026-07-21 225537" src="https://github.com/user-attachments/assets/98599823-e51c-4814-9139-7a0f5ff69c72" />
 
+# RaytracerCompute
 
-Here are the key features implemented in this project:
+GPU path tracer / raytracer built with C++, OpenGL 4.6, GLFW, GLAD, and GLSL compute shaders.
 
-Camera & Rendering
-Monte Carlo Path Tracing: Realistic global illumination.
+The renderer uses a compute shader for ray tracing, then displays the result through a fullscreen pass. It supports multiple scenes, camera movement, accumulation across frames, and simple depth-of-field parameters.
 
-Anti-aliasing: Multisampled pixels for smooth edges.
+## Features
 
-Depth of Field (Defocus Blur): Simulating a physical camera lens with a configurable aperture and focus distance.
+- Compute-shader based ray tracing
+- Scene switching with multiple built-in scenes
+- Camera movement with mouse look and WASD controls
+- Frame accumulation for progressive refinement
+- Fullscreen presentation pass with gamma correction
+- Scene upload via SSBOs for objects and materials
 
-Background Color: Skybox gradients or solid background colors.
+## Project Structure
 
-Geometries & Volumes
-Basic Shapes: Spheres and Rectangles (axis-aligned planes: XY, XZ, YZ).
+- `src/` - C++ source files for renderer, scene setup, shaders, and OpenGL helpers
+- `shaders/` - GLSL shaders used by the compute and fullscreen pipeline
+- `external/` - vendored third-party libraries (`glfw`, `glad`, `glm`)
+- `build/` - generated CMake build output
 
-Complex Shapes: 3D Boxes (constructed from rectangles).
+## Requirements
 
-Volumetric Rendering: Constant density mediums to simulate smoke, fog, or clouds.
+- Windows
+- CMake 3.15 or newer
+- A C++17 compiler
+- OpenGL-capable GPU with driver support for OpenGL 4.6
 
-Instances & Transformations: Translation and Y-axis rotation of objects.
+All required libraries are already included in the repository under `external/`.
 
-Materials
-Lambertian (Diffuse): Matte surfaces that scatter light randomly.
+## Build
 
-Metal: Reflective surfaces with adjustable "fuzziness".
+From the repository root:
 
-Dielectric: Transparent materials like glass, water, or diamonds (simulating Snell's Law and the Schlick approximation for reflectivity).
+```powershell
+cmake -S . -B build
+cmake --build build --config Release
+```
 
-Diffuse Light (Emissive): Materials that emit light, acting as light sources in the scene (e.g., Cornell Box lighting).
+The executable is generated at:
+
+```text
+build/Release/RaytracerCompute.exe
+```
+
+## Run
+
+Run the executable from the repository root so the shader paths resolve correctly:
+
+```powershell
+cd "C:\Users\thold\Desktop\OpenGLproj\Raytracer"
+.\build\Release\RaytracerCompute.exe
+```
+
+The application loads shaders from relative paths such as `shaders/raytrace.comp`, so starting it from another working directory may fail unless you copy the shader folder or adjust the runtime paths.
+
+## Controls
+
+- `W`, `A`, `S`, `D` - move the camera
+- Right mouse button + drag - look around
+- `Left Arrow` - previous scene
+- `Right Arrow` - next scene
+- `Esc` - close the application
+
+## Scenes
+
+The built-in scenes are defined in `src/Scene.cpp`:
+
+- `Scene1` - a room with multiple objects
+- `Scene2` - a simpler empty room
+- `Scene3` - an experimental scene with a large scale layout
+
+Scenes are loaded in `src/main.cpp` and registered with the renderer at startup.
+
+## Notes
+
+- The renderer accumulates frames over time, so the image becomes cleaner the longer the camera stays still.
+- When the camera moves or the scene changes, accumulation is reset.
+- Camera defaults such as field of view, focus distance, and lens size are copied from the active scene into the renderer when a scene is uploaded.
+- There is currently no ImGui-based UI.
+- See [docs/README.md](docs/README.md) for a more detailed technical overview.
+
+## Troubleshooting
+
+- If the window opens but the image is black, make sure the executable is launched from the repository root so the shader files can be found.
+- If shader compilation fails, check the console output for GLSL errors.
+- If you change scene geometry and see no update, make sure the scene is added in `src/main.cpp` and its objects are pushed into the `objects` vector.
+
+## License
+
+No explicit license file is included yet.
+
