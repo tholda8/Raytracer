@@ -1,3 +1,5 @@
+<img width="1339" height="1340" alt="Snímek obrazovky 2026-07-21 211650" src="https://github.com/user-attachments/assets/c4b77b10-9684-4dc7-8e83-0ec4235237d2" />
+<img width="1641" height="1295" alt="Snímek obrazovky 2026-07-21 225537" src="https://github.com/user-attachments/assets/98599823-e51c-4814-9139-7a0f5ff69c72" />
 # Raytracer
 This raytracer simulates the physical behavior of light bouncing around a 3D scene. By tracing rays from the camera through the pixels and into the scene, it computes accurate lighting, shadows, and material interactions.
 
