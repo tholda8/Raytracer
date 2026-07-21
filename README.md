@@ -86,7 +86,6 @@ Scenes are loaded in `src/main.cpp` and registered with the renderer at startup.
 - When the camera moves or the scene changes, accumulation is reset.
 - Camera defaults such as field of view, focus distance, and lens size are copied from the active scene into the renderer when a scene is uploaded.
 - There is currently no ImGui-based UI.
-- See [docs/README.md](docs/README.md) for a more detailed technical overview.
 
 ## Troubleshooting
 
